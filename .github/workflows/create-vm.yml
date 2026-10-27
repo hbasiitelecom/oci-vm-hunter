@@ -20,7 +20,7 @@ permissions:
 jobs:
   create:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 12
     env:
       SUPPRESS_LABEL_WARNING: "True"
       PYTHONWARNINGS: ignore
@@ -93,3 +93,13 @@ jobs:
       - name: Nettoyer
         if: always()
         run: rm -rf .oci
+
+      # Le planificateur de GitHub est souvent en retard : le robot se relance lui-même
+      # (workflow_dispatch est autorisé avec GITHUB_TOKEN). Le cron reste en filet de sécurité.
+      - name: Relancer dans 4 minutes
+        if: steps.exists.outputs.id == '' && steps.launch.outputs.id == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 240
+          gh workflow run create-vm.yml --repo "$GITHUB_REPOSITORY"
