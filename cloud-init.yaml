@@ -1,0 +1,61 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - fail2ban
+  - unattended-upgrades
+  - git
+  - curl
+  - libpango-1.0-0
+  - libpangoft2-1.0-0
+  - libharfbuzz-subset0
+  - fonts-dejavu-core
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/10-audit-hbo.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+      PubkeyAuthentication yes
+      AllowUsers ubuntu
+      MaxAuthTries 3
+      LoginGraceTime 20
+      X11Forwarding no
+      AllowAgentForwarding no
+  - path: /etc/fail2ban/jail.d/sshd.local
+    content: |
+      [sshd]
+      enabled = true
+      backend = systemd
+      maxretry = 3
+      findtime = 10m
+      bantime = 1h
+  - path: /etc/apt/apt.conf.d/52audit-hbo-upgrades
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "04:30";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+  - path: /etc/sysctl.d/90-audit-hbo.conf
+    content: |
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.tcp_syncookies = 1
+      kernel.kptr_restrict = 2
+
+runcmd:
+  - fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  - sysctl -w vm.swappiness=20
+  - sysctl --system
+  - systemctl restart ssh
+  - systemctl enable --now fail2ban
+  - timedatectl set-timezone Europe/Paris
+  - useradd --system --create-home --home-dir /opt/audit-hbo --shell /usr/sbin/nologin audithbo
+  - chmod 750 /opt/audit-hbo
+  - touch /var/lib/cloud/instance/audit-hbo-ready
