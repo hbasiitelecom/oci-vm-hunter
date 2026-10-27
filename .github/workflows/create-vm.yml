@@ -5,7 +5,7 @@ name: Créer la VM Oracle Always Free
 # Dès qu'elle existe : issue (e-mail GitHub) puis désactivation du workflow.
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -25,11 +25,11 @@ jobs:
       SUPPRESS_LABEL_WARNING: "True"
       PYTHONWARNINGS: ignore
       OCI_CLI_CONFIG_FILE: ${{ github.workspace }}/.oci/config
-      COMPARTMENT: ${{ vars.OCI_COMPARTMENT }}
-      SUBNET: ${{ vars.OCI_SUBNET }}
-      AD: ${{ vars.OCI_AD }}
-      ARM_IMAGE: ${{ vars.OCI_ARM_IMAGE }}
-      X86_IMAGE: ${{ vars.OCI_X86_IMAGE }}
+      COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
+      SUBNET: ${{ secrets.OCI_SUBNET }}
+      AD: ${{ secrets.OCI_AD }}
+      ARM_IMAGE: ${{ secrets.OCI_ARM_IMAGE }}
+      X86_IMAGE: ${{ secrets.OCI_X86_IMAGE }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,10 +41,10 @@ jobs:
           printf '%s\n' "$OCI_KEY" > .oci/key.pem && chmod 600 .oci/key.pem
           cat > .oci/config <<EOF
           [DEFAULT]
-          user=${{ vars.OCI_USER }}
-          fingerprint=${{ vars.OCI_FINGERPRINT }}
-          tenancy=${{ vars.OCI_TENANCY }}
-          region=${{ vars.OCI_REGION }}
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=${{ secrets.OCI_REGION }}
           key_file=${{ github.workspace }}/.oci/key.pem
           EOF
           chmod 600 .oci/config
@@ -62,7 +62,7 @@ jobs:
         id: launch
         if: steps.exists.outputs.id == ''
         run: |
-          case $(( $(date +%s) / 1200 % 3 )) in
+          case $(( $(date +%s) / 300 % 3 )) in
             0) name="ARM 2 cœurs / 12 Go"; shape=(--shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' --image-id "$ARM_IMAGE");;
             1) name="ARM 1 cœur / 6 Go";   shape=(--shape VM.Standard.A1.Flex --shape-config '{"ocpus":1,"memoryInGBs":6}' --image-id "$ARM_IMAGE");;
             *) name="Micro AMD";           shape=(--shape VM.Standard.E2.1.Micro --image-id "$X86_IMAGE");;
