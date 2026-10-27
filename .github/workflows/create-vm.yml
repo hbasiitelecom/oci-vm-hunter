@@ -1,11 +1,11 @@
 name: Créer la VM Oracle Always Free
 
-# Toutes les 30 minutes : tente de créer la VM « audit-hbo » (Always Free, eu-paris-1)
-# tant qu'elle n'existe pas. Dès qu'elle existe, ouvre une issue (e-mail GitHub) et
-# désactive ce workflow.
+# Tente de créer la VM « audit-hbo » (Always Free, eu-paris-1) tant qu'elle n'existe pas :
+# un seul essai rapide par passage, sans réessai (évite les 429), forme en alternance.
+# Dès qu'elle existe : issue (e-mail GitHub) puis désactivation du workflow.
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "*/20 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -20,7 +20,7 @@ permissions:
 jobs:
   create:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 6
     env:
       SUPPRESS_LABEL_WARNING: "True"
       PYTHONWARNINGS: ignore
@@ -48,40 +48,34 @@ jobs:
           key_file=${{ github.workspace }}/.oci/key.pem
           EOF
           chmod 600 .oci/config
-          pipx install oci-cli >/dev/null
+          pip install --quiet --disable-pip-version-check oci-cli
 
       - name: La VM existe-t-elle déjà ?
         id: exists
         run: |
-          id=$(oci compute instance list -c "$COMPARTMENT" --display-name audit-hbo \
+          id=$(oci --no-retry compute instance list -c "$COMPARTMENT" --display-name audit-hbo \
                  --query 'data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`] | [0].id' \
                  --raw-output 2>/dev/null || true)
-          if [ -n "$id" ] && [ "$id" != "null" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; fi
+          if [ -n "$id" ] && [ "$id" != "null" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; echo "Déjà créée."; fi
 
-      - name: Tenter la création (ARM 2/12, puis ARM 1/6, puis micro AMD)
+      - name: Tenter la création
         id: launch
         if: steps.exists.outputs.id == ''
         run: |
-          common=(-c "$COMPARTMENT" --availability-domain "$AD" --display-name audit-hbo
-                  --hostname-label audit-hbo --boot-volume-size-in-gbs 50 --subnet-id "$SUBNET"
-                  --assign-public-ip true --ssh-authorized-keys-file ssh_key.pub
-                  --user-data-file cloud-init.yaml
-                  --instance-options '{"areLegacyImdsEndpointsDisabled":true}'
-                  --query 'data.id' --raw-output)
-          try() {
-            echo "::group::$1"
-            out=$(oci compute instance launch "${common[@]}" "${@:2}" 2>&1) || true
-            echo "::endgroup::"
-            id=$(echo "$out" | grep -o 'ocid1\.instance[^ "]*' | head -1)
-            if [ -n "$id" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; echo "Créée : $1"; return 0; fi
-            echo "$1 : $(echo "$out" | grep -o '"message": "[^"]*"' | head -1)"
-            sleep 20
-            return 1
-          }
-          try "ARM 2 cœurs / 12 Go" --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' --image-id "$ARM_IMAGE" ||
-          try "ARM 1 cœur / 6 Go"   --shape VM.Standard.A1.Flex --shape-config '{"ocpus":1,"memoryInGBs":6}'  --image-id "$ARM_IMAGE" ||
-          try "Micro AMD"           --shape VM.Standard.E2.1.Micro --image-id "$X86_IMAGE" ||
-          echo "Pas de capacité pour l'instant : nouvel essai dans 30 minutes."
+          case $(( $(date +%s) / 1200 % 3 )) in
+            0) name="ARM 2 cœurs / 12 Go"; shape=(--shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' --image-id "$ARM_IMAGE");;
+            1) name="ARM 1 cœur / 6 Go";   shape=(--shape VM.Standard.A1.Flex --shape-config '{"ocpus":1,"memoryInGBs":6}' --image-id "$ARM_IMAGE");;
+            *) name="Micro AMD";           shape=(--shape VM.Standard.E2.1.Micro --image-id "$X86_IMAGE");;
+          esac
+          out=$(oci --no-retry compute instance launch -c "$COMPARTMENT" --availability-domain "$AD" \
+                  --display-name audit-hbo --hostname-label audit-hbo --boot-volume-size-in-gbs 50 \
+                  --subnet-id "$SUBNET" --assign-public-ip true --ssh-authorized-keys-file ssh_key.pub \
+                  --user-data-file cloud-init.yaml \
+                  --instance-options '{"areLegacyImdsEndpointsDisabled":true}' \
+                  "${shape[@]}" --query 'data.id' --raw-output 2>&1) || true
+          id=$(echo "$out" | grep -o 'ocid1\.instance[^ "]*' | head -1)
+          if [ -n "$id" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; echo "Créée : $name"; exit 0; fi
+          echo "$name : $(echo "$out" | grep -o '"message": "[^"]*"' | head -1)"
 
       - name: Prévenir et arrêter le robot
         if: steps.launch.outputs.id != ''
@@ -89,11 +83,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ID: ${{ steps.launch.outputs.id }}
         run: |
-          sleep 60
+          sleep 45
           ip=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output || echo "?")
           shape=$(oci compute instance get --instance-id "$ID" --query 'data.shape' --raw-output || echo "?")
           gh issue create --repo "$GITHUB_REPOSITORY" --title "VM audit-hbo créée ($shape, $ip)" \
-            --body "La VM Oracle est créée : forme $shape, IP publique $ip. Reviens dans la session Claude et dis « la VM est créée » pour la suite (durcissement, Tailscale, déploiement)."
+            --body "La VM Oracle est créée : forme $shape, IP publique $ip. Reviens dans la session Claude et dis « la VM est créée » pour la suite."
           gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY"
 
       - name: Nettoyer
