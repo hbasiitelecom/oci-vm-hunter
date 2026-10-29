@@ -1,7 +1,8 @@
-name: Créer la VM Oracle Always Free
+name: Créer la VM ARM Oracle Always Free
 
-# Tente de créer la VM « audit-hbo » (Always Free, eu-paris-1) tant qu'elle n'existe pas :
-# un seul essai rapide par passage, sans réessai (évite les 429), forme en alternance.
+# Tente de créer la VM ARM « audit-hbo-arm » (Always Free, eu-paris-1) tant qu'elle n'existe pas,
+# pour remplacer la petite VM Micro « audit-hbo » : un seul essai rapide par passage, sans réessai
+# (évite les 429), taille en alternance, jamais au-delà du gratuit (4 cœurs / 24 Go).
 # Dès qu'elle existe : issue (e-mail GitHub) puis désactivation du workflow.
 on:
   schedule:
@@ -53,7 +54,7 @@ jobs:
       - name: La VM existe-t-elle déjà ?
         id: exists
         run: |
-          id=$(oci --no-retry compute instance list -c "$COMPARTMENT" --display-name audit-hbo \
+          id=$(oci --no-retry compute instance list -c "$COMPARTMENT" --display-name audit-hbo-arm \
                  --query 'data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`] | [0].id' \
                  --raw-output 2>/dev/null || true)
           if [ -n "$id" ] && [ "$id" != "null" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; echo "Déjà créée."; fi
@@ -63,13 +64,15 @@ jobs:
         if: steps.exists.outputs.id == ''
         run: |
           case $(( $(date +%s) / 300 % 3 )) in
-            0) name="ARM 2 cœurs / 12 Go"; shape=(--shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' --image-id "$ARM_IMAGE");;
-            1) name="ARM 1 cœur / 6 Go";   shape=(--shape VM.Standard.A1.Flex --shape-config '{"ocpus":1,"memoryInGBs":6}' --image-id "$ARM_IMAGE");;
-            *) name="Micro AMD";           shape=(--shape VM.Standard.E2.1.Micro --image-id "$X86_IMAGE");;
+            0) cpu=4; mem=24;;
+            1) cpu=2; mem=12;;
+            *) cpu=1; mem=6;;
           esac
+          name="ARM $cpu cœurs / $mem Go"
+          shape=(--shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$cpu,\"memoryInGBs\":$mem}" --image-id "$ARM_IMAGE")
           out=$(oci --no-retry compute instance launch -c "$COMPARTMENT" --availability-domain "$AD" \
-                  --display-name audit-hbo --hostname-label audit-hbo --boot-volume-size-in-gbs 50 \
-                  --subnet-id "$SUBNET" --assign-public-ip true --ssh-authorized-keys-file ssh_key.pub \
+                  --display-name audit-hbo-arm --hostname-label audit-hbo-arm --boot-volume-size-in-gbs 50 \
+                  --subnet-id "$SUBNET" --assign-public-ip true --private-ip 10.0.1.50 --ssh-authorized-keys-file ssh_key.pub \
                   --user-data-file cloud-init.yaml \
                   --instance-options '{"areLegacyImdsEndpointsDisabled":true}' \
                   "${shape[@]}" --query 'data.id' --raw-output 2>&1) || true
@@ -84,10 +87,10 @@ jobs:
           ID: ${{ steps.launch.outputs.id }}
         run: |
           sleep 45
-          ip=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."public-ip"' --raw-output || echo "?")
+          ip=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."private-ip"' --raw-output || echo "?")
           shape=$(oci compute instance get --instance-id "$ID" --query 'data.shape' --raw-output || echo "?")
-          gh issue create --repo "$GITHUB_REPOSITORY" --title "VM audit-hbo créée ($shape, $ip)" \
-            --body "La VM Oracle est créée : forme $shape, IP publique $ip. Reviens dans la session Claude et dis « la VM est créée » pour la suite."
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "VM ARM audit-hbo-arm créée ($shape, IP interne $ip)" \
+            --body "La VM ARM est créée : forme $shape, IP interne $ip. Reviens dans la session Claude et dis « la VM ARM est créée » pour migrer Audit HBO."
           gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY"
 
       - name: Nettoyer
