@@ -1,12 +1,13 @@
 name: Créer la VM ARM Oracle Always Free
 
 # Tente de créer la VM ARM « audit-hbo-arm » (Always Free, eu-paris-1) tant qu'elle n'existe pas,
-# pour remplacer la petite VM Micro « audit-hbo » : un seul essai rapide par passage, sans réessai
-# (évite les 429), taille en alternance, jamais au-delà du gratuit (4 cœurs / 24 Go).
+# pour remplacer la petite VM Micro « audit-hbo » : essais en boucle (~1 par minute, sans
+# réessai interne de la CLI), taille et domaine de pannes en alternance, jamais au-delà du
+# gratuit (4 cœurs / 24 Go).
 # Dès qu'elle existe : issue (e-mail GitHub) puis désactivation du workflow.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -21,7 +22,7 @@ permissions:
 jobs:
   create:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 345
     env:
       SUPPRESS_LABEL_WARNING: "True"
       PYTHONWARNINGS: ignore
@@ -59,26 +60,47 @@ jobs:
                  --raw-output 2>/dev/null || true)
           if [ -n "$id" ] && [ "$id" != "null" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; echo "Déjà créée."; fi
 
-      - name: Tenter la création
+      # Essais en boucle pendant ~5 h 30 (un passage = un travail GitHub, 6 h maximum) :
+      # environ un essai par minute, au lieu d'un toutes les 5 minutes. Tailles en alternance,
+      # les petites plus souvent (plus faciles à obtenir, agrandissables ensuite), et domaine
+      # de pannes en alternance. Pause de 5 min si Oracle limite le débit (429). Arrêt en
+      # échec, donc e-mail de GitHub, si une autre erreur se répète (clé expirée, quota…).
+      - name: Tenter la création en boucle
         id: launch
         if: steps.exists.outputs.id == ''
         run: |
-          case $(( $(date +%s) / 300 % 3 )) in
-            0) cpu=4; mem=24;;
-            1) cpu=2; mem=12;;
-            *) cpu=1; mem=6;;
-          esac
-          name="ARM $cpu cœurs / $mem Go"
-          shape=(--shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$cpu,\"memoryInGBs\":$mem}" --image-id "$ARM_IMAGE")
-          out=$(oci --no-retry compute instance launch -c "$COMPARTMENT" --availability-domain "$AD" \
-                  --display-name audit-hbo-arm --hostname-label audit-hbo-arm --boot-volume-size-in-gbs 50 \
-                  --subnet-id "$SUBNET" --assign-public-ip true --private-ip 10.0.1.50 --ssh-authorized-keys-file ssh_key.pub \
-                  --user-data-file cloud-init.yaml \
-                  --instance-options '{"areLegacyImdsEndpointsDisabled":true}' \
-                  "${shape[@]}" --query 'data.id' --raw-output 2>&1) || true
-          id=$(echo "$out" | grep -o 'ocid1\.instance[^ "]*' | head -1)
-          if [ -n "$id" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; echo "Créée : $name"; exit 0; fi
-          echo "$name : $(echo "$out" | grep -o '"message": "[^"]*"' | head -1)"
+          shapes=("1 6" "2 12" "1 6" "4 24" "2 12" "1 6")
+          domains=("" FAULT-DOMAIN-1 FAULT-DOMAIN-2 FAULT-DOMAIN-3)
+          deadline=$(( $(date +%s) + 330 * 60 ))
+          n=0; other=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            read -r cpu mem <<< "${shapes[$(( n % ${#shapes[@]} ))]}"
+            fd=${domains[$(( (n / ${#shapes[@]}) % ${#domains[@]} ))]}
+            n=$((n + 1))
+            name="ARM $cpu cœurs / $mem Go${fd:+, $fd}"
+            out=$(oci --no-retry compute instance launch -c "$COMPARTMENT" --availability-domain "$AD" \
+                    ${fd:+--fault-domain "$fd"} \
+                    --display-name audit-hbo-arm --hostname-label audit-hbo-arm --boot-volume-size-in-gbs 50 \
+                    --subnet-id "$SUBNET" --assign-public-ip true --private-ip 10.0.1.50 --ssh-authorized-keys-file ssh_key.pub \
+                    --user-data-file cloud-init.yaml \
+                    --instance-options '{"areLegacyImdsEndpointsDisabled":true}' \
+                    --shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$cpu,\"memoryInGBs\":$mem}" \
+                    --image-id "$ARM_IMAGE" --query 'data.id' --raw-output 2>&1) || true
+            id=$(echo "$out" | grep -o 'ocid1\.instance[^ "]*' | head -1)
+            if [ -n "$id" ]; then
+              echo "id=$id" >> "$GITHUB_OUTPUT"; echo "$(date -u +%H:%M:%S) essai $n — Créée : $name"; exit 0
+            fi
+            msg=$(echo "$out" | grep -o '"message": "[^"]*"' | head -1)
+            echo "$(date -u +%H:%M:%S) essai $n — $name : ${msg:-$(echo "$out" | tail -1)}"
+            case "$out" in
+              *"Out of host capacity"*|*InternalError*|*"Service unavailable"*) other=0; pause=$(( 55 + RANDOM % 15 ));;
+              *TooManyRequests*) other=0; pause=300;;
+              *) other=$((other + 1)); pause=120
+                 if [ "$other" -ge 5 ]; then echo "::error::Erreur répétée, robot arrêté : $msg"; exit 1; fi;;
+            esac
+            sleep "$pause"
+          done
+          echo "Fin du passage après $n essais, relance."
 
       - name: Prévenir et arrêter le robot
         if: steps.launch.outputs.id != ''
@@ -97,12 +119,11 @@ jobs:
         if: always()
         run: rm -rf .oci
 
-      # Le planificateur de GitHub est souvent en retard : le robot se relance lui-même
-      # (workflow_dispatch est autorisé avec GITHUB_TOKEN). Le cron reste en filet de sécurité.
-      - name: Relancer dans 4 minutes
+      # Le robot se relance lui-même à la fin de chaque passage (workflow_dispatch est
+      # autorisé avec GITHUB_TOKEN). Le cron reste en filet de sécurité.
+      - name: Relancer
         if: steps.exists.outputs.id == '' && steps.launch.outputs.id == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sleep 240
           gh workflow run create-vm.yml --repo "$GITHUB_REPOSITORY"
