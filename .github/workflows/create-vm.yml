@@ -60,11 +60,13 @@ jobs:
                  --raw-output 2>/dev/null || true)
           if [ -n "$id" ] && [ "$id" != "null" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; echo "Déjà créée."; fi
 
-      # Essais en boucle pendant ~5 h 30 (un passage = un travail GitHub, 6 h maximum) :
-      # environ un essai par minute, au lieu d'un toutes les 5 minutes. Tailles en alternance,
-      # les petites plus souvent (plus faciles à obtenir, agrandissables ensuite), et domaine
-      # de pannes en alternance. Pause de 5 min si Oracle limite le débit (429). Arrêt en
-      # échec, donc e-mail de GitHub, si une autre erreur se répète (clé expirée, quota…).
+      # Essais en boucle pendant ~5 h 30 (un passage = un travail GitHub, 6 h maximum).
+      # Cadence adaptative : Oracle refuse (429) un lancement trop proche du précédent ;
+      # l'intervalle s'allonge d'une minute à chaque refus et raccourcit de 10 s à chaque
+      # réponse normale, pour coller à la limite sans la dépasser. Un essai refusé (429) est
+      # retenté avec la même taille. Tailles en alternance, les petites plus souvent (plus
+      # faciles à obtenir, agrandissables ensuite), et domaine de pannes en alternance.
+      # Arrêt en échec, donc e-mail de GitHub, si une autre erreur se répète (clé, quota…).
       - name: Tenter la création en boucle
         id: launch
         if: steps.exists.outputs.id == ''
@@ -72,11 +74,12 @@ jobs:
           shapes=("1 6" "2 12" "1 6" "4 24" "2 12" "1 6")
           domains=("" FAULT-DOMAIN-1 FAULT-DOMAIN-2 FAULT-DOMAIN-3)
           deadline=$(( $(date +%s) + 330 * 60 ))
-          n=0; other=0
+          n=0; tries=0; other=0; refused=0
+          interval=150  # secondes entre deux essais, ajusté selon les refus 429
           while [ "$(date +%s)" -lt "$deadline" ]; do
             read -r cpu mem <<< "${shapes[$(( n % ${#shapes[@]} ))]}"
             fd=${domains[$(( (n / ${#shapes[@]}) % ${#domains[@]} ))]}
-            n=$((n + 1))
+            n=$((n + 1)); tries=$((tries + 1))
             name="ARM $cpu cœurs / $mem Go${fd:+, $fd}"
             out=$(oci --no-retry compute instance launch -c "$COMPARTMENT" --availability-domain "$AD" \
                     ${fd:+--fault-domain "$fd"} \
@@ -88,19 +91,22 @@ jobs:
                     --image-id "$ARM_IMAGE" --query 'data.id' --raw-output 2>&1) || true
             id=$(echo "$out" | grep -o 'ocid1\.instance[^ "]*' | head -1)
             if [ -n "$id" ]; then
-              echo "id=$id" >> "$GITHUB_OUTPUT"; echo "$(date -u +%H:%M:%S) essai $n — Créée : $name"; exit 0
+              echo "id=$id" >> "$GITHUB_OUTPUT"; echo "$(date -u +%H:%M:%S) essai $tries — Créée : $name"; exit 0
             fi
             msg=$(echo "$out" | grep -o '"message": "[^"]*"' | head -1)
-            echo "$(date -u +%H:%M:%S) essai $n — $name : ${msg:-$(echo "$out" | tail -1)}"
+            echo "$(date -u +%H:%M:%S) essai $tries (intervalle ${interval} s) — $name : ${msg:-$(echo "$out" | tail -1)}"
             case "$out" in
-              *"Out of host capacity"*|*InternalError*|*"Service unavailable"*) other=0; pause=$(( 55 + RANDOM % 15 ));;
-              *TooManyRequests*) other=0; pause=300;;
-              *) other=$((other + 1)); pause=120
+              *TooManyRequests*|*"Too many requests"*)
+                other=0; refused=$((refused + 1)); n=$((n - 1))  # même taille au prochain essai
+                interval=$(( interval + 60 > 600 ? 600 : interval + 60 ));;
+              *"Out of host capacity"*|*InternalError*|*"Service unavailable"*)
+                other=0; interval=$(( interval - 10 < 90 ? 90 : interval - 10 ));;
+              *) other=$((other + 1))
                  if [ "$other" -ge 5 ]; then echo "::error::Erreur répétée, robot arrêté : $msg"; exit 1; fi;;
             esac
-            sleep "$pause"
+            sleep $(( interval + RANDOM % 10 ))
           done
-          echo "Fin du passage après $n essais, relance."
+          echo "Fin du passage : $tries essais dont $refused refusés (429), dernier intervalle ${interval} s."
 
       - name: Prévenir et arrêter le robot
         if: steps.launch.outputs.id != ''
