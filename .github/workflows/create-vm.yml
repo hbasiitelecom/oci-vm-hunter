@@ -2,8 +2,8 @@ name: Créer la VM ARM Oracle Always Free
 
 # Tente de créer la VM ARM « audit-hbo-arm » (Always Free, eu-paris-1) tant qu'elle n'existe pas,
 # pour remplacer la petite VM Micro « audit-hbo » : essais en boucle (~1 par minute, sans
-# réessai interne de la CLI), taille et domaine de pannes en alternance, jamais au-delà du
-# gratuit (4 cœurs / 24 Go).
+# réessai interne de la CLI), taille en alternance, jamais au-delà du
+# gratuit (2 cœurs / 12 Go depuis 2026, page « Always Free Resources » d'Oracle).
 # Dès qu'elle existe : issue (e-mail GitHub) puis désactivation du workflow.
 on:
   schedule:
@@ -65,24 +65,21 @@ jobs:
       # l'intervalle s'allonge d'une minute à chaque refus et raccourcit de 10 s à chaque
       # réponse normale, pour coller à la limite sans la dépasser. Un essai refusé (429) est
       # retenté avec la même taille. Tailles en alternance, les petites plus souvent (plus
-      # faciles à obtenir, agrandissables ensuite), et domaine de pannes en alternance.
+      # faciles à obtenir, agrandissables ensuite). Domaine de pannes laissé au choix d'Oracle.
       # Arrêt en échec, donc e-mail de GitHub, si une autre erreur se répète (clé, quota…).
       - name: Tenter la création en boucle
         id: launch
         if: steps.exists.outputs.id == ''
         run: |
-          shapes=("1 6" "2 12" "1 6" "4 24" "2 12" "1 6")
-          domains=("" FAULT-DOMAIN-1 FAULT-DOMAIN-2 FAULT-DOMAIN-3)
+          shapes=("1 6" "2 12")  # jamais au-delà de 2 cœurs / 12 Go (limite gratuite)
           deadline=$(( $(date +%s) + 330 * 60 ))
           n=0; tries=0; other=0; refused=0
-          interval=150  # secondes entre deux essais, ajusté selon les refus 429
+          interval=120  # secondes entre deux essais, ajusté selon les refus 429
           while [ "$(date +%s)" -lt "$deadline" ]; do
             read -r cpu mem <<< "${shapes[$(( n % ${#shapes[@]} ))]}"
-            fd=${domains[$(( (n / ${#shapes[@]}) % ${#domains[@]} ))]}
             n=$((n + 1)); tries=$((tries + 1))
-            name="ARM $cpu cœurs / $mem Go${fd:+, $fd}"
+            name="ARM $cpu cœurs / $mem Go"
             out=$(oci --no-retry compute instance launch -c "$COMPARTMENT" --availability-domain "$AD" \
-                    ${fd:+--fault-domain "$fd"} \
                     --display-name audit-hbo-arm --hostname-label audit-hbo-arm --boot-volume-size-in-gbs 50 \
                     --subnet-id "$SUBNET" --assign-public-ip true --private-ip 10.0.1.50 --ssh-authorized-keys-file ssh_key.pub \
                     --user-data-file cloud-init.yaml \
@@ -100,7 +97,7 @@ jobs:
                 other=0; refused=$((refused + 1)); n=$((n - 1))  # même taille au prochain essai
                 interval=$(( interval + 60 > 600 ? 600 : interval + 60 ));;
               *"Out of host capacity"*|*InternalError*|*"Service unavailable"*)
-                other=0; interval=$(( interval - 10 < 90 ? 90 : interval - 10 ));;
+                other=0; interval=$(( interval - 10 < 120 ? 120 : interval - 10 ));;
               *) other=$((other + 1))
                  if [ "$other" -ge 5 ]; then echo "::error::Erreur répétée, robot arrêté : $msg"; exit 1; fi;;
             esac
