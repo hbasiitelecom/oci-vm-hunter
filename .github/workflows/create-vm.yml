@@ -1,7 +1,7 @@
 name: Créer la VM ARM Oracle Always Free
 
 # Tente de créer la VM ARM « audit-hbo-arm » (Always Free, eu-paris-1) tant qu'elle n'existe pas,
-# pour remplacer la petite VM Micro « audit-hbo » : essais en boucle (~1 par minute, sans
+# pour remplacer la petite VM Micro « audit-hbo » : essais en boucle (~1 toutes les 2 min, sans
 # réessai interne de la CLI), taille en alternance, jamais au-delà du
 # gratuit (2 cœurs / 12 Go depuis 2026, page « Always Free Resources » d'Oracle).
 # Dès qu'elle existe : issue (e-mail GitHub) puis désactivation du workflow.
