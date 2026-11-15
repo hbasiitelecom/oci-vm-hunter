@@ -1,0 +1,59 @@
+#cloud-config
+# Préparation initiale de la VM NetBox (Oracle, Ubuntu 24.04) : voir deploy/netbox/README.md.
+# Identique à deploy/oracle/cloud-init.yaml, sans les bibliothèques PDF ni le compte audithbo,
+# avec 3 Go de swap (NetBox sur 1 Go de RAM).
+package_update: true
+package_upgrade: true
+packages:
+  - fail2ban
+  - unattended-upgrades
+  - git
+  - curl
+  - age
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/10-netbox.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+      PubkeyAuthentication yes
+      AllowUsers ubuntu
+      MaxAuthTries 3
+      LoginGraceTime 20
+      X11Forwarding no
+      AllowAgentForwarding no
+  - path: /etc/fail2ban/jail.d/sshd.local
+    content: |
+      [sshd]
+      enabled = true
+      backend = systemd
+      maxretry = 3
+      findtime = 10m
+      bantime = 1h
+  - path: /etc/apt/apt.conf.d/52netbox-upgrades
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "04:30";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+  - path: /etc/sysctl.d/90-netbox.conf
+    content: |
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.tcp_syncookies = 1
+      kernel.kptr_restrict = 2
+
+runcmd:
+  - fallocate -l 3G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  - sysctl -w vm.swappiness=20 && echo 'vm.swappiness = 20' >> /etc/sysctl.d/90-netbox.conf
+  - sysctl --system
+  - systemctl restart ssh
+  - systemctl enable --now fail2ban
+  - timedatectl set-timezone Europe/Paris
+  - touch /var/lib/cloud/instance/netbox-ready

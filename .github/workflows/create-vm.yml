@@ -1,10 +1,8 @@
-name: Créer la VM ARM Oracle Always Free
+name: Créer les VM Oracle Always Free
 
-# Tente de créer la VM ARM « audit-hbo-arm » (Always Free, eu-paris-1) tant qu'elle n'existe pas,
-# pour remplacer la petite VM Micro « audit-hbo » : essais en boucle (~1 toutes les 2 min, sans
-# réessai interne de la CLI), taille en alternance, jamais au-delà du
-# gratuit (2 cœurs / 12 Go depuis 2026, page « Always Free Resources » d'Oracle).
-# Dès qu'elle existe : issue (e-mail GitHub) puis désactivation du workflow.
+# Une seule boucle pour tout le compte (chasser.sh) : VM « netbox » (Micro) et VM ARM
+# « audit-hbo-arm » (2 cœurs / 12 Go au plus, limite gratuite), à tour de rôle, ~1 essai
+# toutes les 2 min. Chaque VM créée : issue (e-mail GitHub). Toutes créées : robot désactivé.
 on:
   schedule:
     - cron: "17 * * * *"
@@ -31,7 +29,6 @@ jobs:
       SUBNET: ${{ secrets.OCI_SUBNET }}
       AD: ${{ secrets.OCI_AD }}
       ARM_IMAGE: ${{ secrets.OCI_ARM_IMAGE }}
-      X86_IMAGE: ${{ secrets.OCI_X86_IMAGE }}
     steps:
       - uses: actions/checkout@v4
 
@@ -52,81 +49,45 @@ jobs:
           chmod 600 .oci/config
           pip install --quiet --disable-pip-version-check oci-cli
 
-      - name: La VM existe-t-elle déjà ?
-        id: exists
+      # Configuration de démarrage de NetBox : cloud-init, puis Tailscale avec la clé à usage
+      # unique (secret TS_AUTHKEY, jamais affichée). Sans le secret, la cible netbox est ignorée.
+      - name: Préparer la VM NetBox
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
-          id=$(oci --no-retry compute instance list -c "$COMPARTMENT" --display-name audit-hbo-arm \
-                 --query 'data[?"lifecycle-state"!=`TERMINATED` && "lifecycle-state"!=`TERMINATING`] | [0].id' \
-                 --raw-output 2>/dev/null || true)
-          if [ -n "$id" ] && [ "$id" != "null" ]; then echo "id=$id" >> "$GITHUB_OUTPUT"; echo "Déjà créée."; fi
+          [ -n "$TS_AUTHKEY" ] || { echo "Secret TS_AUTHKEY absent : NetBox ignorée."; exit 0; }
+          [[ "$TS_AUTHKEY" =~ ^tskey-auth-[A-Za-z0-9_-]+$ ]] || { echo "::error::TS_AUTHKEY n'est pas une clé tskey-auth-…"; exit 1; }
+          ( umask 077
+            cat netbox-cloud-init.yaml
+            printf "  - curl -fsSL https://tailscale.com/install.sh | sh\n"
+            printf "  - [sh, -c, \"umask 077; printf %%s '%s' > /run/netbox-tailscale.cle\"]\n" "$TS_AUTHKEY"
+            printf "  - tailscale up --hostname=netbox --auth-key=file:/run/netbox-tailscale.cle\n"
+            printf "  - rm -f /run/netbox-tailscale.cle\n"
+          ) > .oci/netbox-user-data.yaml
 
-      # Essais en boucle pendant ~5 h 30 (un passage = un travail GitHub, 6 h maximum).
-      # Cadence adaptative : Oracle refuse (429) un lancement trop proche du précédent ;
-      # l'intervalle s'allonge d'une minute à chaque refus et raccourcit de 10 s à chaque
-      # réponse normale, pour coller à la limite sans la dépasser. Un essai refusé (429) est
-      # retenté avec la même taille. Tailles en alternance, les petites plus souvent (plus
-      # faciles à obtenir, agrandissables ensuite). Domaine de pannes laissé au choix d'Oracle.
-      # Arrêt en échec, donc e-mail de GitHub, si une autre erreur se répète (clé, quota…).
-      - name: Tenter la création en boucle
-        id: launch
-        if: steps.exists.outputs.id == ''
-        run: |
-          shapes=("1 6" "2 12")  # jamais au-delà de 2 cœurs / 12 Go (limite gratuite)
-          deadline=$(( $(date +%s) + 330 * 60 ))
-          n=0; tries=0; other=0; refused=0
-          interval=120  # secondes entre deux essais, ajusté selon les refus 429
-          while [ "$(date +%s)" -lt "$deadline" ]; do
-            read -r cpu mem <<< "${shapes[$(( n % ${#shapes[@]} ))]}"
-            n=$((n + 1)); tries=$((tries + 1))
-            name="ARM $cpu cœurs / $mem Go"
-            out=$(oci --no-retry compute instance launch -c "$COMPARTMENT" --availability-domain "$AD" \
-                    --display-name audit-hbo-arm --hostname-label audit-hbo-arm --boot-volume-size-in-gbs 50 \
-                    --subnet-id "$SUBNET" --assign-public-ip true --private-ip 10.0.1.50 --ssh-authorized-keys-file ssh_key.pub \
-                    --user-data-file cloud-init.yaml \
-                    --instance-options '{"areLegacyImdsEndpointsDisabled":true}' \
-                    --shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$cpu,\"memoryInGBs\":$mem}" \
-                    --image-id "$ARM_IMAGE" --query 'data.id' --raw-output 2>&1) || true
-            id=$(echo "$out" | grep -o 'ocid1\.instance[^ "]*' | head -1)
-            if [ -n "$id" ]; then
-              echo "id=$id" >> "$GITHUB_OUTPUT"; echo "$(date -u +%H:%M:%S) essai $tries — Créée : $name"; exit 0
-            fi
-            msg=$(echo "$out" | grep -o '"message": "[^"]*"' | head -1)
-            echo "$(date -u +%H:%M:%S) essai $tries (intervalle ${interval} s) — $name : ${msg:-$(echo "$out" | tail -1)}"
-            case "$out" in
-              *TooManyRequests*|*"Too many requests"*)
-                other=0; refused=$((refused + 1)); n=$((n - 1))  # même taille au prochain essai
-                interval=$(( interval + 60 > 600 ? 600 : interval + 60 ));;
-              *"Out of host capacity"*|*InternalError*|*"Service unavailable"*)
-                other=0; interval=$(( interval - 10 < 120 ? 120 : interval - 10 ));;
-              *) other=$((other + 1))
-                 if [ "$other" -ge 5 ]; then echo "::error::Erreur répétée, robot arrêté : $msg"; exit 1; fi;;
-            esac
-            sleep $(( interval + RANDOM % 10 ))
-          done
-          echo "Fin du passage : $tries essais dont $refused refusés (429), dernier intervalle ${interval} s."
-
-      - name: Prévenir et arrêter le robot
-        if: steps.launch.outputs.id != ''
+      - name: Chasser les VM manquantes
+        id: hunt
         env:
           GH_TOKEN: ${{ github.token }}
-          ID: ${{ steps.launch.outputs.id }}
+          ON_CREATED: ./prevenir.sh
         run: |
-          sleep 45
-          ip=$(oci compute instance list-vnics --instance-id "$ID" --query 'data[0]."private-ip"' --raw-output || echo "?")
-          shape=$(oci compute instance get --instance-id "$ID" --query 'data.shape' --raw-output || echo "?")
-          gh issue create --repo "$GITHUB_REPOSITORY" --title "VM ARM audit-hbo-arm créée ($shape, IP interne $ip)" \
-            --body "La VM ARM est créée : forme $shape, IP interne $ip. Reviens dans la session Claude et dis « la VM ARM est créée » pour migrer Audit HBO."
-          gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY"
+          [ -s .oci/netbox-user-data.yaml ] && export NETBOX_USER_DATA=.oci/netbox-user-data.yaml
+          ./chasser.sh
 
       - name: Nettoyer
         if: always()
         run: rm -rf .oci
 
+      - name: "Tout est créé : arrêter le robot"
+        if: steps.hunt.outcome == 'success' && steps.hunt.outputs.remaining == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable create-vm.yml --repo "$GITHUB_REPOSITORY"
+
       # Le robot se relance lui-même à la fin de chaque passage (workflow_dispatch est
       # autorisé avec GITHUB_TOKEN). Le cron reste en filet de sécurité.
       - name: Relancer
-        if: steps.exists.outputs.id == '' && steps.launch.outputs.id == ''
+        if: steps.hunt.outcome == 'success' && steps.hunt.outputs.remaining != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run create-vm.yml --repo "$GITHUB_REPOSITORY"
+        run: gh workflow run create-vm.yml --repo "$GITHUB_REPOSITORY"
